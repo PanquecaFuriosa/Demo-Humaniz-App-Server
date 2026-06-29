@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query, HTTPException, Response
+from app.config import settings
 
 router = APIRouter()
 
