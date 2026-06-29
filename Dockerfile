@@ -1,5 +1,5 @@
 # We use a lightweight Python image
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 # Prevent Python from generating .pyc files and let it know we are in container mode
 ENV PYTHONDONTWRITEBYTECODE=1
