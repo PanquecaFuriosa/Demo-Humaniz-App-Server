@@ -1,3 +1,4 @@
+import os
 from sqlalchemy.future import select
 from app.core.database import AsyncSessionLocal
 from app.core.whatsapp_gateway import whatsapp_gateway
@@ -7,58 +8,107 @@ from app.features.receive_invoice.schemas import MobilePaymentData
 
 class ReceiveInvoiceService:
     async def execute_processing(self, message_content: dict, message_id: str, sender: str) -> None:
-        """Coordinates the use case and persists the states in the database"""
-        
-        # 1. Create the initial audit record (Status: RECEIVED) using message_id
+        """
+        Coordinates the core business use case.
+        Maintains granular database context boundaries to safeguard the connection pool.
+        """
+        # Step 1: Initialize audit footprint
         async with AsyncSessionLocal() as db:
             audit_record = InvoiceAudit(whatsapp_id=message_id, sender=sender, status="RECEIVED")
             db.add(audit_record)
             await db.commit()
-            await db.refresh(audit_record)
+            
+        saved_path = None
 
-            try:
-                # 2. Update to PROCESSING status
-                audit_record.status = "PROCESSING"
+        try:
+            # Step 2: Elevate state to PROCESSING
+            await self._update_audit_status(message_id, "PROCESSING")
+
+            # Step 3: Offload asset retrieval to the Infrastructure Layer
+            saved_path = await whatsapp_gateway.download_image(message_content, message_id, sender)
+            if not saved_path:
+                await self._handle_failure(
+                    whatsapp_id=message_id, 
+                    sender=sender, 
+                    error_log="Evolution API media retrieval failure.", 
+                    user_message="No pudimos descargar tu imagen."
+                )
+                return
+
+            # Bind local path metadata to the current audit scope
+            await self._update_local_path(message_id, saved_path)
+
+            # Step 4: Outsource Vision/AI analysis to the Gemini Gateway
+            payment_data = await gemini_gateway.analyze_mobile_payment(saved_path)
+            if not payment_data:
+                await self._handle_failure(
+                    whatsapp_id=message_id, 
+                    sender=sender, 
+                    error_log="Gemini vision model extraction yielded null/empty structured data.", 
+                    user_message="No logramos extraer los datos automáticamente."
+                )
+                return
+
+            # Step 5: Finalize transaction tracking state to COMPLETED
+            await self._finalize_audit_success(message_id, payment_data)
+
+            # Step 6: Trigger consumer notification
+            success_message = self._construct_success_message(payment_data)
+            await whatsapp_gateway.send_message(sender, success_message)
+
+        except Exception as e:
+            print(f"[Service] Critical runtime exception caught within message execution {message_id}: {e}")
+            await self._handle_failure(message_id, sender, f"Unexpected execution crash: {str(e)}")
+
+        finally:
+            # Step 7: Strict IO Clean-up boundary condition
+            if saved_path and os.path.exists(saved_path):
+                try:
+                    os.remove(saved_path)
+                    print(f"[Service] Ephemeral storage cleared. Deleted: {saved_path}")
+                except Exception as cleanup_error:
+                    print(f"[Service] Failed to purge resource at {saved_path}: {cleanup_error}")
+
+    # --- ISOLATED REUSABLE DATABASE MUTATIONS ---
+
+    async def _update_audit_status(self, whatsapp_id: str, status: str) -> None:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(InvoiceAudit).where(InvoiceAudit.whatsapp_id == whatsapp_id))
+            record = result.scalar_one_or_none()
+            if record:
+                record.status = status
                 await db.commit()
 
-                # 3. Download image 
-                saved_path = await whatsapp_gateway.download_image(message_content, message_id, sender)
-                if not saved_path:
-                    audit_record.status = "FAILED"
-                    audit_record.error_log = "Error downloading the image from Evolution API."
-                    await db.commit()
-                    await whatsapp_gateway.send_message(sender, "No pudimos descargar tu imagen.")
-                    return
-
-                audit_record.local_path = saved_path
+    async def _update_local_path(self, whatsapp_id: str, path: str) -> None:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(InvoiceAudit).where(InvoiceAudit.whatsapp_id == whatsapp_id))
+            record = result.scalar_one_or_none()
+            if record:
+                record.local_path = path
                 await db.commit()
 
-                # 4. Process with AI 
-                payment_data = await gemini_gateway.analyze_mobile_payment(saved_path)
-                if not payment_data:
-                    audit_record.status = "FAILED"
-                    audit_record.error_log = "Gemini failed to extract valid structured data."
-                    await db.commit()
-                    await whatsapp_gateway.send_message(sender, "No logramos extraer los datos automáticamente.")
-                    return
-
-                # 5. Save the successfully extracted data (Status: COMPLETED) 
-                audit_record.issuing_bank = payment_data.issuing_bank
-                audit_record.reference = payment_data.reference
-                audit_record.amount = payment_data.amount
-                audit_record.status = "COMPLETED"
+    async def _finalize_audit_success(self, whatsapp_id: str, data: MobilePaymentData) -> None:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(InvoiceAudit).where(InvoiceAudit.whatsapp_id == whatsapp_id))
+            record = result.scalar_one_or_none()
+            if record:
+                record.issuing_bank = data.issuing_bank
+                record.reference = data.reference
+                record.amount = data.amount
+                record.status = "COMPLETED"
                 await db.commit()
 
-                # 6. Notify the user via WhatsApp
-                message = self._construct_success_message(payment_data)
-                await whatsapp_gateway.send_message(sender, message)
-
-            except Exception as e:
-                await db.rollback()
-                audit_record.status = "FAILED"
-                audit_record.error_log = str(e)
+    async def _handle_failure(self, whatsapp_id: str, sender: str, error_log: str, user_message: str = None) -> None:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(InvoiceAudit).where(InvoiceAudit.whatsapp_id == whatsapp_id))
+            record = result.scalar_one_or_none()
+            if record:
+                record.status = "FAILED"
+                record.error_log = error_log
                 await db.commit()
-                print(f"[Service] Error crítico registrado en auditoría: {e}")
+        
+        if user_message:
+            await whatsapp_gateway.send_message(sender, user_message)
 
     def _construct_success_message(self, data: MobilePaymentData) -> str:
         return (
