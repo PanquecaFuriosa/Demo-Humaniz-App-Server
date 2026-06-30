@@ -1,33 +1,56 @@
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Request
 from app.features.receive_invoice.tasks import process_invoice_async
 from app.config import settings
 
 router = APIRouter()
 
 @router.post("/webhook")
-async def receive_whatsapp_message(data: dict, background_tasks: BackgroundTasks):
+async def receive_whatsapp_message(request: Request, background_tasks: BackgroundTasks):
     try:
-        entry = data.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
+        # Fetch the JSON payload directly from the request
+        payload = await request.json()
         
-        if "messages" in value:
-            mensaje = value["messages"][0]
-            message_type = mensaje.get("type")
-            sender = mensaje.get("from")
+        # 1. Validate that it's a new message event
+        if payload.get("event") != "messages.upsert":
+            return {"status": "ignored_event"}
             
-            if message_type == "image":
-                image_id = mensaje["image"]["id"]
-                print(f"[Router] Imagen detectada. Agendando tarea en segundo plano...")
-                
-                # Handles the asynchronous task natively in FastAPI
-                background_tasks.add_task(process_invoice_async, image_id, sender)
-                
-            elif message_type == "text":
-                print(f"[Router] Texto recibido de {sender}: {mensaje['text']['body']}")
-                
-    except Exception as e:
-        print(f"[Router] Error parseando Webhook: {e}")
+        message_data = payload.get("data", {})
+        key = message_data.get("key", {})
         
-    # Always responds to Meta with a "200 OK" quickly to free up the connection.
+        # 2. CRITICAL FILTER: Ignore if the message was sent by the bot itself
+        if key.get("fromMe") is True:
+            return {"status": "ignored_self"}
+            
+        # 3. Extract sender (Comes as "584129906876@s.whatsapp.net")
+        remote_jid = key.get("remoteJid", "")
+        sender = remote_jid.split("@")[0] if remote_jid else ""
+        
+        # 4. Extract message body content
+        message_content = message_data.get("message", {})
+        
+        # --- CASE 1: IMAGE DETECTION ---
+        if "imageMessage" in message_content:
+            image_block = message_content["imageMessage"]
+            
+            # In Evolution API, you need the full message block to download the media later,
+            # but you can use the key ID as a reference identifier.
+            message_id = key.get("id") 
+            
+            print(f"[Router] Image detected from {sender}. Scheduling background task...")
+            
+            # Pass the structured data to your background worker
+            background_tasks.add_task(process_invoice_async, message_content, sender, message_id)
+            
+        # --- CASE 2: TEXT DETECTION ---
+        elif "conversation" in message_content or "extendedTextMessage" in message_content:
+            text_body = (
+                message_content.get("conversation") or 
+                message_content.get("extendedTextMessage", {}).get("text", "")
+            )
+            print(f"[Router] Text received from {sender}: {text_body}")
+            
+    except Exception as e:
+        print(f"[Router] Critical error parsing Evolution Webhook: {e}")
+        
+    # Always respond with a 200 OK immediately to free up the Evolution API worker
     return {"status": "accepted"}

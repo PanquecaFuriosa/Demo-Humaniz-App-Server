@@ -1,9 +1,23 @@
-from app.features.receive_invoice.service import invoice_service
+import requests
 
-async def process_invoice_async(image_id: str, sender: str):
-    print(f"[Task] Hilo asíncrono iniciado para la imagen {image_id}")
-    try:
-        # The task only invokes the service use case.
-        await invoice_service.execute_processing(image_id, sender)
-    except Exception as e:
-        print(f"[Task] Error crítico en el hilo de segundo plano: {e}")
+def process_invoice_async(message_content: dict, sender: str, message_id: str):
+    # 'message_content' contains the {"imageMessage": {...}} dictionary forwarded by the router
+    
+    url_evolution = "https://demo-humaniz-evolution-api-gateway.onrender.com/chat/getBase64FromMediaMessage/my_first_test"
+    headers = {
+        "apikey": "MySecureInvoiceToken2026",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "message": message_content
+    }
+    
+    response = requests.post(url_evolution, json=payload, headers=headers)
+    if response.status_code == 200:
+        # This returns the decrypted file as a Base64 string, ready for your OCR / AI logic
+        base64_data = response.json().get("base64") 
+        
+        print(f"[Task] Successfully downloaded image buffer from message {message_id}")
+        # ... Execute your business logic here (Supabase storage, AI parser, etc.)
+    else:
+        print(f"[Task] Failed to download media from Evolution API: {response.text}")
