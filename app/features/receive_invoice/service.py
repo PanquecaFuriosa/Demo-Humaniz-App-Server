@@ -93,6 +93,7 @@ class ReceiveInvoiceService:
             record = result.scalar_one_or_none()
             if record:
                 record.issuing_bank = data.issuing_bank
+                record.receiving_bank = data.receiving_bank
                 record.reference = data.reference
                 record.amount = data.amount
                 record.status = "COMPLETED"
