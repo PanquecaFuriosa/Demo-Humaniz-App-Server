@@ -1,72 +1,81 @@
-import os
 import httpx
-from app.config import settings
+import base64
+import os
+from app.config import settings 
 
 class WhatsAppGateway:
     def __init__(self):
-        self.headers = {
-            "Authorization": f"Bearer {settings.META_ACCESS_TOKEN}",
+        self.base_url = "https://demo-humaniz-evolution-api-gateway.onrender.com"
+        self.apikey = "MySecureInvoiceToken2026"
+        self.instance_name = "my_first_test"
+
+    async def download_image(self, message_content: dict, message_id: str, sender: str) -> str | None:
+        """
+        Consumes Evolution API decryption endpoint, decodes the Base64 response,
+        and saves it to the local disk for Gemini to ingest.
+        """
+        url = f"{self.base_url}/chat/getBase64FromMediaMessage/{self.instance_name}"
+        headers = {
+            "apikey": self.apikey,
             "Content-Type": "application/json"
         }
-        os.makedirs(settings.DOWNLOADS_DIR, exist_ok=True)
-        self.send_url = f"https://graph.facebook.com/v25.0/{settings.PHONE_NUMBER_ID}/messages"
-
-    async def download_image(self, image_id: str, sender: str) -> str | None:
-        """Two-step workflow to download file bytes from Meta"""
-        async with httpx.AsyncClient() as client:
-            try:
-                # Step 1: Obtain the temporary URL
-                url_api = f"https://graph.facebook.com/v25.0/{image_id}"
-                response = await client.get(url_api, headers=self.headers)
-                
-                if response.status_code != 200:
-                    print(f"[Gateway] Error obteniendo metadatos: {response.text}")
-                    return None
-                    
-                real_download_url = response.json().get("url")
-                if not real_download_url:
-                    return None
-                    
-                # Step 2: Download the binary
-                print("[Gateway] Descargando bytes de la imagen...")
-                response_file = await client.get(real_download_url, headers=self.headers)
-                
-                if response_file.status_code == 200:
-                    file_path = f"{settings.DOWNLOADS_DIR}/factura_{sender}_{image_id}.jpg"
-                    with open(file_path, "wb") as f:
-                        f.write(response_file.content)
-                    return file_path
-                    
-            except Exception as e:
-                print(f"[Gateway] Error crítico en descarga: {e}")
-        return None
-    
-    async def send_message(self, receiver: str, texto: str) -> bool:
-        """Send a free text message to a WhatsApp number via Meta"""
         payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": receiver,
-            "type": "text",
-            "text": {
-                "preview_url": False,
-                "body": texto
-            }
+            "message": message_content
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, headers=headers, timeout=30.0)
+                
+            if response.status_code == 200:
+                base64_data = response.json().get("base64")
+                if not base64_data:
+                    print("[WhatsAppGateway] No base64 data found in API response.")
+                    return None
+
+                # 1. Decodes the Base64 bytes
+                image_bytes = base64.b64decode(base64_data)
+
+                # 2. Ensures that the destination directory exists locally.
+                output_dir = "data/invoices"
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # 3. Saves the file to disk
+                saved_path = f"{output_dir}/{message_id}.jpg"
+                with open(saved_path, "wb") as f:
+                    f.write(image_bytes)
+
+                print(f"[WhatsAppGateway] Imagen guardada exitosamente en: {saved_path}")
+                return saved_path
+            else:
+                print(f"[WhatsAppGateway] Error de la API al desencriptar: {response.text}")
+                return None
+
+        except Exception as e:
+            print(f"[WhatsAppGateway] Error en la descarga/escritura de medios: {e}")
+            return None
+
+    async def send_message(self, sender: str, text: str) -> bool:
+        """Sends an outbound text message using Evolution API format"""
+        url = f"{self.base_url}/message/sendText/{self.instance_name}"
+        headers = {
+            "apikey": self.apikey,
+            "Content-Type": "application/json"
         }
         
-        async with httpx.AsyncClient() as client:
-            try:
-                print(f"[Gateway] Enviando respuesta a WhatsApp para {receiver}...")
-                response = await client.post(self.send_url, headers=self.headers, json=payload)
-                
-                if response.status_code in [200, 201]:
-                    print(f"[Gateway] Mensaje enviado con éxito a {receiver}.")
-                    return True
-                else:
-                    print(f"[Gateway] Error al enviar mensaje: {response.status_code} - {response.text}")
-                    return False
-            except Exception as e:
-                print(f"[Gateway] Error crítico enviando mensaje: {e}")
-                return False
+        # Note: Evolution API prefers receiving the number with or without @s.whatsapp.net,
+        # but to ensure compatibility, we send the cleaned number string.
+        payload = {
+            "number": sender,
+            "text": text
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, headers=headers)
+            return response.status_code in [200, 201]
+        except Exception as e:
+            print(f"[WhatsAppGateway] Error enviando mensaje a {sender}: {e}")
+            return False
 
 whatsapp_gateway = WhatsAppGateway()
